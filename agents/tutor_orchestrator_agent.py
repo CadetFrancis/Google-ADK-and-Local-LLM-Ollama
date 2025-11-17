@@ -1,9 +1,8 @@
 """Tutor Orchestrator Agent for managing the language learning loop."""
-import base64
 from typing import Optional, Dict, Any, Tuple
 from google.adk.agents import LlmAgent
-from .tools import text_to_speech, speech_to_text, analyze_pronunciation
 from .content_generator_agent import ContentGeneratorAgent
+from .live_audio_client import GeminiLiveAudioClient
 
 
 class TutorOrchestratorAgent(LlmAgent):
@@ -23,6 +22,9 @@ class TutorOrchestratorAgent(LlmAgent):
         self,
         content_generator: Optional[ContentGeneratorAgent] = None,
         model: str = "gemini-2.5-flash-native-audio-preview-09-2025",
+        live_audio_client: Optional[GeminiLiveAudioClient] = None,
+        live_api_key: Optional[str] = None,
+        live_audio_voice: str = "Studio",
         **kwargs
     ):
         """
@@ -34,24 +36,26 @@ class TutorOrchestratorAgent(LlmAgent):
             model: The ADK model to use for the agent (default: gemini-2.5-flash-native-audio-preview-09-2025)
             **kwargs: Additional arguments passed to LlmAgent
         """
-        # Configure the agent with the specified model and tools
+        # Configure the agent with the specified model
         # Pass config parameters directly to LlmAgent
         super().__init__(
             name="tutor_orchestrator",
             instruction=(
                 "You are a language learning tutor that orchestrates the learning loop. "
                 "You manage the learning session, present phrases to users, analyze their "
-                "pronunciation, and provide feedback. Use the available tools for text-to-speech, "
-                "speech-to-text, and pronunciation analysis."
+                "pronunciation, and provide feedback. Use the model's native Live API "
+                "capabilities for audio synthesis, transcription, and pronunciation analysis."
             ),
             model=model,
-            tools=[text_to_speech, speech_to_text, analyze_pronunciation],
             **kwargs
         )
         
         # Use PrivateAttr for non-model fields
         self._content_generator: Optional[ContentGeneratorAgent] = content_generator
         self._user_context: Optional[Dict[str, str]] = None
+        self._live_audio_client: Optional[GeminiLiveAudioClient] = live_audio_client
+        self._live_api_key = live_api_key
+        self._live_audio_voice = live_audio_voice
     
     @property
     def content_generator(self) -> ContentGeneratorAgent:
@@ -110,7 +114,7 @@ class TutorOrchestratorAgent(LlmAgent):
     
     async def present_phrase(self, phrase: str) -> bytes:
         """
-        Present a phrase with TTS.
+        Present a phrase with Live API-powered TTS.
         
         Args:
             phrase: The phrase to present
@@ -124,14 +128,8 @@ class TutorOrchestratorAgent(LlmAgent):
         self._ensure_context()
         
         language_code = self._get_language_code(self._user_context["language"])
-        # Tools are synchronous, but we can call them in async context
-        # Tool returns base64-encoded string, decode to bytes
-        audio_base64 = text_to_speech(
-            text=phrase,
-            language=language_code
-        )
-        
-        return base64.b64decode(audio_base64)
+        audio_client = self._ensure_live_audio_client()
+        return await audio_client.synthesize_phrase_audio(phrase, language_code)
     
     async def analyze_user_speech(
         self,
@@ -154,24 +152,12 @@ class TutorOrchestratorAgent(LlmAgent):
         self._ensure_context()
         
         language_code = self._get_language_code(self._user_context["language"])
-        
-        # Encode audio bytes to base64 string for tool
-        audio_base64 = base64.b64encode(user_audio).decode('utf-8')
-        
-        # First, convert speech to text
-        user_text = speech_to_text(
-            audio=audio_base64,
-            language=language_code
+        audio_client = self._ensure_live_audio_client()
+        return await audio_client.analyze_pronunciation(
+            user_audio,
+            target_phrase,
+            language_code,
         )
-        
-        # Then, analyze pronunciation
-        analysis = analyze_pronunciation(
-            user_audio=audio_base64,
-            target_text=target_phrase,
-            language=language_code
-        )
-        
-        return analysis
     
     async def provide_feedback(
         self,
@@ -213,12 +199,11 @@ class TutorOrchestratorAgent(LlmAgent):
                 feedback_text += "Try to match the pronunciation more closely."
         
         language_code = self._get_language_code(self._user_context["language"])
-        # Tool returns base64-encoded string, decode to bytes
-        feedback_audio_base64 = text_to_speech(
-            text=feedback_text,
-            language=language_code
+        audio_client = self._ensure_live_audio_client()
+        feedback_audio = await audio_client.synthesize_phrase_audio(
+            feedback_text,
+            language_code,
         )
-        feedback_audio = base64.b64decode(feedback_audio_base64)
         
         return feedback_text, feedback_audio
     
@@ -265,4 +250,16 @@ class TutorOrchestratorAgent(LlmAgent):
         """Close resources and clean up."""
         if self._content_generator is not None:
             await self._content_generator.close()
+
+    def _ensure_live_audio_client(self) -> GeminiLiveAudioClient:
+        """
+        Lazily create a Live API helper bound to the current Gemini model.
+        """
+        if self._live_audio_client is None:
+            self._live_audio_client = GeminiLiveAudioClient(
+                model=self.model,
+                api_key=self._live_api_key,
+                voice=self._live_audio_voice,
+            )
+        return self._live_audio_client
 
